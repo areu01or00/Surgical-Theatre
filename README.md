@@ -12,7 +12,7 @@ SurgicalTheater is a lightweight Python library that solves the **GPU memory exp
 
 ### The Problem
 
-During training (especially LoRA/fine-tuning), you want to validate frequently, but:
+During training (LoRA/fine-tuning/RL), you want to validate frequently, but:
 
 ```python
 # Your model uses 20GB GPU memory
@@ -44,7 +44,7 @@ SurgicalTheater provides a simple context manager that:
 - ✨ **Eliminates memory overhead** (32KB vs 20GB)
 - ✨ **Enables frequent validation** (every 10 steps vs once per epoch)
 - ✨ **Preserves training state** (no gradient contamination)
-- ✨ **Works with any PyTorch model** (LoRA, full fine-tuning, etc.)
+- ✨ **Works with any PyTorch model** (LoRA, full fine-tuning, RL/RLHF, etc.)
 
 **Key Insight**: Instead of copying the entire model, SurgicalTheater creates a safe, isolated environment for validation using minimal memory.
 
@@ -198,7 +198,7 @@ with SurgicalTheater(model, modification_type="custom",
 ## 💡 Use Cases
 
 ### 1. **LoRA/PEFT Training**
-The primary use case - validate frequently without memory overhead:
+Validate frequently during fine-tuning without memory overhead:
 ```python
 # Traditional LoRA training (bad)
 for epoch in range(10):
@@ -230,7 +230,49 @@ for epoch in range(10):
                 # - Detect overfitting early
 ```
 
-### 2. **Hyperparameter Search**
+### 2. **Reinforcement Learning (RL/RLHF)**
+**Critical for preventing reward hacking** - validate frequently during RL training:
+```python
+# Traditional RL training (bad) - vulnerable to reward hacking
+for episode in range(1000):
+    for step in range(episode_length):
+        # RL training step
+        action = policy(state)
+        reward = environment.step(action)
+        policy.update(reward)
+    
+    # Can only validate once per episode (too expensive!)
+    # Model might overfit to training reward signal
+    val_reward = validate_policy(policy)  # 💥 Memory spike
+
+# With SurgicalTheater (good) - prevents reward hacking
+for episode in range(1000):
+    for step in range(episode_length):
+        # RL training step (same as before)
+        action = policy(state)
+        reward = environment.step(action)
+        policy.update(reward)
+        
+        # Validate every 50 steps to catch reward hacking early!
+        if step % 50 == 0:
+            with SurgicalTheater(policy):
+                # Test on held-out validation environment
+                val_reward = validate_policy(policy)  # ✨ Only 32KB overhead
+                
+                # Early detection of:
+                # - Reward hacking behaviors
+                # - Overfitting to training environment
+                # - Policy degradation
+                # - Catastrophic forgetting
+```
+
+**Why this matters for RL:**
+- **Reward Hacking Prevention**: Catch policies exploiting training reward loopholes
+- **Robust Evaluation**: Test on different environments frequently
+- **Early Stopping**: Stop before policy becomes too specialized
+- **Safety Monitoring**: Detect harmful behaviors during training
+
+### 3. **Hyperparameter Search**
 Test configurations without reloading:
 ```python
 configs = generate_configs()
@@ -239,7 +281,7 @@ for config in configs:
         score = evaluate(model)
 ```
 
-### 3. **Research Experiments**
+### 4. **Research Experiments**
 Safely test modifications:
 ```python
 # Test attention head importance
