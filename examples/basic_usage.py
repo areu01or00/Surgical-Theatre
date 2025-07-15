@@ -187,14 +187,13 @@ def example_custom_modification():
         nn.Linear(16, 1)
     )
     
-    # Define custom modification function
-    def attention_style_modification(module, layer_name, temperature=1.0):
+    # Define custom modification function (NEW API: return delta directly)
+    def attention_style_modification(param, temperature=1.0):
         """Apply attention-style scaling to weights."""
-        if hasattr(module, 'weight'):
-            # Apply softmax-like scaling
-            weight = module.weight.data
-            scaled = torch.softmax(weight / temperature, dim=1)
-            module.weight.data = scaled * weight.shape[1]  # Rescale
+        # Compute attention-style scaling and return delta
+        scaled = torch.softmax(param / temperature, dim=1)
+        scaled_weights = scaled * param.shape[1]  # Rescale
+        return scaled_weights - param  # Return delta, not modified weights
     
     test_data = torch.randn(20, 10)
     

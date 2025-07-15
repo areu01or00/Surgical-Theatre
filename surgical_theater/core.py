@@ -31,6 +31,7 @@ class SurgicalTheater:
         
         With specific modifications:
         >>> with SurgicalTheater(model, layers=[0, 1], modification_type="scale", factor=0.9) as theater:
+        ...     # factor=0.9 → delta = -10% (reduces weights by 10%)
         ...     performance = evaluate(model)
     """
     
@@ -71,19 +72,34 @@ class SurgicalTheater:
         
         # Modification tracking
         self._modifications_applied = []
+        
+        # Thread safety / re-entrancy protection
+        self._entered = False
     
     def __enter__(self):
         """Enter context and apply temporary modifications."""
-        if self.track_memory:
-            self._memory_before = self._get_memory_usage()
+        # Check for re-entrancy
+        if self._entered:
+            raise RuntimeError("SurgicalTheater is not re-entrant. Nested contexts are not supported.")
+        self._entered = True
         
-        # Identify target parameters
-        self._identify_target_parameters()
-        
-        # Compute and apply deltas
-        self._apply_deltas()
-        
-        return self
+        try:
+            if self.track_memory:
+                self._memory_before = self._get_memory_usage()
+            
+            # Identify target parameters
+            self._identify_target_parameters()
+            
+            # Ensure tensor contiguity for safe delta operations
+            self._ensure_contiguity()
+            
+            # Compute and apply deltas
+            self._apply_deltas()
+            
+            return self
+        except Exception:
+            self._entered = False
+            raise
     
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Exit context and restore original weights."""
@@ -101,6 +117,9 @@ class SurgicalTheater:
             self._deltas.clear()
             self._target_params.clear()
             self._modifications_applied.clear()
+            
+            # Reset re-entrancy flag
+            self._entered = False
     
     def _identify_target_parameters(self):
         """Identify parameters to modify based on layers specification."""
@@ -110,15 +129,31 @@ class SurgicalTheater:
             if self._should_modify_layer(layer_name, module, target_layers):
                 # Add parameters that will be modified
                 for param_name, param in module.named_parameters(recurse=False):
-                    if param is not None and param.requires_grad:
+                    # Include both trainable and frozen parameters for broader compatibility
+                    if param is not None:
                         key = f"{layer_name}.{param_name}"
                         self._target_params[key] = param
+    
+    def _ensure_contiguity(self):
+        """Ensure all target parameters are contiguous to avoid storage aliasing issues."""
+        for param_key, param in self._target_params.items():
+            if not param.data.is_contiguous():
+                # Force contiguity to avoid view/transpose/compile aliasing issues
+                param.data = param.data.contiguous()
     
     def _apply_deltas(self):
         """Compute and apply deltas to target parameters."""
         for param_key, param in self._target_params.items():
             # Compute delta based on modification type
             delta = self._compute_delta(param)
+            
+            # Validate delta shape and compatibility
+            if delta.shape != param.shape:
+                raise ValueError(f"Delta shape {delta.shape} doesn't match param shape {param.shape} for {param_key}")
+            
+            # Ensure delta is on same device as parameter
+            if delta.device != param.device:
+                delta = delta.to(param.device)
             
             # Store delta for restoration (this is our memory-efficient approach)
             self._deltas[param_key] = delta.detach()
@@ -146,25 +181,30 @@ class SurgicalTheater:
         """Compute delta for a parameter based on modification type."""
         if self.modification_type == "scale":
             factor = self.kwargs.get('factor', 0.9)
+            # Ensure factor is a tensor on the correct device
+            factor = torch.as_tensor(factor, device=param.device, dtype=param.dtype)
             # delta = param * factor - param = param * (factor - 1)
             return param * (factor - 1.0)
         
         elif self.modification_type == "noise":
             noise_scale = self.kwargs.get('noise_scale', 0.01)
+            # Ensure noise_scale is a tensor on the correct device
+            noise_scale = torch.as_tensor(noise_scale, device=param.device, dtype=param.dtype)
             # delta = noise
             return torch.randn_like(param) * noise_scale
         
         elif self.modification_type == "disable":
-            # delta = 0 - param = -param (use zeros_like to avoid clone)
-            return torch.zeros_like(param) - param
+            # delta = 0 - param = -param
+            return -param
         
         elif self.modification_type == "custom" and self.modification_fn:
-            # For custom modifications, we need to compute the delta
-            original = param.clone()
-            # Apply custom function to a copy
-            modified_copy = param.clone()
-            self.modification_fn(modified_copy, **self.kwargs)
-            return modified_copy - original
+            # For custom modifications, require function to return delta directly
+            # This avoids double-cloning which negates memory benefits
+            delta = self.modification_fn(param, **self.kwargs)
+            if delta is None:
+                raise ValueError("Custom modification function must return a delta tensor")
+            # Shape checking will be done in _apply_deltas
+            return delta
         
         else:
             raise ValueError(f"Unknown modification type: {self.modification_type}")
@@ -172,12 +212,15 @@ class SurgicalTheater:
     def _get_target_layers(self) -> List[str]:
         """Get list of target layer names."""
         if self.layers is None:
-            # Auto-detect attention layers
+            # Auto-detect attention layers (deterministic ordering)
             target_layers = []
+            attention_keywords = ['attention', 'attn', 'self_attn']  # Deterministic order
             for name, module in self.model.named_modules():
-                if any(key in name.lower() for key in ['attention', 'attn', 'self_attn']):
+                name_lower = name.lower()
+                if any(keyword in name_lower for keyword in attention_keywords):
                     target_layers.append(name)
-            return target_layers
+            # Sort for deterministic ordering across runs
+            return sorted(target_layers)
         
         # Convert layer indices to names
         all_layers = list(self.model.named_modules())
@@ -236,6 +279,11 @@ class SurgicalTheater:
                 'memory_mb': delta.numel() * delta.element_size() / (1024 * 1024)
             }
         return stats
+    
+    @property
+    def total_delta_memory_mb(self) -> float:
+        """Get total memory used by all deltas in MB."""
+        return sum(delta.numel() * delta.element_size() for delta in self._deltas.values()) / (1024 * 1024)
 
 
 # Convenience function
