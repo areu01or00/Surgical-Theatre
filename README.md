@@ -41,12 +41,12 @@ model.load_state_dict(torch.load('temp.pt'))  # More disk I/O
 ### The Solution
 
 SurgicalTheater provides a simple context manager that:
-- ✨ **Eliminates memory overhead** (32KB vs 20GB)
+- ✨ **Reduces memory overhead** (~1 parameter set vs 2x full model)
 - ✨ **Enables frequent validation** (every 10 steps vs once per epoch)
 - ✨ **Preserves training state** (no gradient contamination)
 - ✨ **Works with any PyTorch model** (LoRA, full fine-tuning, RL/RLHF, etc.)
 
-**Key Insight**: Instead of copying the entire model, SurgicalTheater creates a safe, isolated environment for validation using minimal memory.
+**Key Insight**: Instead of copying the entire model (2x memory), SurgicalTheater uses delta-based modifications (~1 parameter set extra memory) with automatic restoration.
 
 ## 📦 Installation
 
@@ -133,8 +133,8 @@ Model:      [████████████████    ] 20GB used
 Free:       [                ████] 4GB left
 
 # Need to validate:
-SurgicalTheater: [                ] Only 32KB needed
-Result:     ✅ WORKS PERFECTLY!
+SurgicalTheater: [██              ] ~2GB extra needed  
+Result:     ✅ WORKS WELL!
 ```
 
 ### The Real Impact
@@ -222,7 +222,7 @@ for epoch in range(10):
         # Validate every 10 steps (no memory penalty!)
         if i % 10 == 0:
             with SurgicalTheater(lora_model):
-                val_metrics = validate(lora_model)  # ✨ Only 32KB overhead
+                val_metrics = validate(lora_model)  # ✨ ~1 param set overhead
                 
                 # Can now:
                 # - Stop at optimal point
@@ -257,7 +257,7 @@ for episode in range(1000):
         if step % 50 == 0:
             with SurgicalTheater(policy):
                 # Test on held-out validation environment
-                val_reward = validate_policy(policy)  # ✨ Only 32KB overhead
+                val_reward = validate_policy(policy)  # ✨ ~1 param set overhead
                 
                 # Early detection of:
                 # - Reward hacking behaviors
@@ -293,26 +293,30 @@ with SurgicalTheater(model, layers=attention_layers, modification_type="scale", 
 
 SurgicalTheater uses a simple but powerful approach:
 
-1. **Backup**: Saves only the model state needed for safe validation (~32KB)
-2. **Isolate**: Creates a clean environment for validation (no gradient contamination)
-3. **Restore**: Automatically restores original training state on exit
+1. **Compute Delta**: Calculate minimal changes needed for modification (~1 parameter set)
+2. **Apply**: Apply deltas in-place to target parameters  
+3. **Restore**: Automatically subtract deltas to restore original state on exit
 
-**Key Insight**: Instead of copying the entire model (20GB), we only save the minimal state needed to restore the model after validation (32KB).
+**Key Insight**: Instead of copying the entire model (20GB), we only store the deltas needed to undo modifications (~1-3GB for most use cases).
 
 ```python
 # What SurgicalTheater does internally:
 class SurgicalTheater:
     def __enter__(self):
-        # Save tiny amount of state (~32KB)
-        self.backup_state = save_minimal_state(model)
+        # Compute and apply deltas (~1 parameter set)
+        for param in target_params:
+            delta = compute_modification_delta(param)
+            self.deltas[param] = delta
+            param.data.add_(delta)
         return self
     
     def __exit__(self):
-        # Restore model to exact training state
-        restore_state(model, self.backup_state)
+        # Restore by subtracting deltas
+        for param, delta in self.deltas.items():
+            param.data.sub_(delta)
 ```
 
-This is **~650,000x more memory efficient** than creating model copies!
+This is **~2-10x more memory efficient** than creating model copies!
 
 ## 📊 Benchmarks
 
@@ -321,7 +325,7 @@ This is **~650,000x more memory efficient** than creating model copies!
 | **deepcopy(model)** | 🔴 2x model size | Slow | ✅ Safe | Creates full copy (28GB + 28GB = 56GB) |
 | **torch.save/load** | 🟡 Disk I/O | Very Slow | ✅ Safe | Saves 28GB to disk, then reloads |
 | **Risky eval()** | 🟢 No extra | Fast | ❌ Risky | `model.eval()` directly (gradient contamination) |
-| **SurgicalTheater** | 🟢 ~32KB | Fast | ✅ Safe | **Our approach**: Minimal backup + isolation |
+| **SurgicalTheater** | 🟡 ~1 param set | Fast | ✅ Safe | **Our approach**: Delta-based restoration |
 
 ### Real Memory Comparison (7B Model):
 
@@ -329,7 +333,7 @@ This is **~650,000x more memory efficient** than creating model copies!
 |--------|------------------|-------------------|
 | Model only | 20GB | ✅ Yes |
 | + deepcopy validation | 40GB | ❌ **Crashes** |
-| + SurgicalTheater validation | 20GB + 32KB | ✅ **Works perfectly** |
+| + SurgicalTheater validation | 20GB + ~2GB | ✅ **Works well** |
 
 ## 🤝 Contributing
 

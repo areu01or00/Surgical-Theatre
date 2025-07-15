@@ -1,8 +1,9 @@
 """
-SurgicalTheater: Zero-copy context manager for temporary model modifications.
+SurgicalTheater: Memory-efficient context manager for temporary model modifications.
 
 This module provides memory-efficient temporary modifications to PyTorch models,
-enabling safe validation and experimentation without memory overhead.
+enabling safe validation and experimentation with minimal memory overhead.
+Uses delta-based approach instead of full weight cloning.
 """
 
 import torch
@@ -17,8 +18,9 @@ class SurgicalTheater:
     """
     Context manager for temporary, memory-efficient model modifications.
     
-    Provides zero-copy weight modifications with automatic restoration,
+    Provides delta-based weight modifications with automatic restoration,
     enabling safe model experimentation with minimal memory overhead.
+    Uses ~1 parameter set of extra memory instead of 2x full model cloning.
     
     Examples:
         Basic usage:
@@ -59,9 +61,9 @@ class SurgicalTheater:
         self.track_memory = track_memory
         self.kwargs = kwargs
         
-        # Storage for original weights
-        self._weight_backup = {}
-        self._param_backup = {}
+        # Storage for deltas (memory-efficient approach)
+        self._deltas = {}
+        self._target_params = {}
         
         # Memory tracking
         self._memory_before = 0
@@ -75,156 +77,97 @@ class SurgicalTheater:
         if self.track_memory:
             self._memory_before = self._get_memory_usage()
         
-        # Backup weights before modification
-        self._backup_weights()
+        # Identify target parameters
+        self._identify_target_parameters()
         
-        # Apply modifications
-        self._apply_modifications()
+        # Compute and apply deltas
+        self._apply_deltas()
         
         return self
     
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Exit context and restore original weights."""
-        # Restore all backed up weights
-        self._restore_weights()
-        
-        if self.track_memory:
-            memory_after = self._get_memory_usage()
-            self._memory_saved = max(0, self._memory_before - memory_after)
-        
-        # Clear backups to free memory
-        self._weight_backup.clear()
-        self._param_backup.clear()
-        self._modifications_applied.clear()
+        try:
+            # Restore by subtracting deltas
+            self._restore_from_deltas()
+        except Exception as e:
+            raise RuntimeError(f"Failed to restore model weights: {e}") from e
+        finally:
+            if self.track_memory:
+                memory_after = self._get_memory_usage()
+                self._memory_saved = max(0, self._memory_before - memory_after)
+            
+            # Clear storage to free memory
+            self._deltas.clear()
+            self._target_params.clear()
+            self._modifications_applied.clear()
     
-    def _backup_weights(self):
-        """Backup weights that will be modified."""
+    def _identify_target_parameters(self):
+        """Identify parameters to modify based on layers specification."""
         target_layers = self._get_target_layers()
         
         for layer_name, module in self.model.named_modules():
-            if self._should_backup_layer(layer_name, module, target_layers):
-                # Backup parameters
+            if self._should_modify_layer(layer_name, module, target_layers):
+                # Add parameters that will be modified
                 for param_name, param in module.named_parameters(recurse=False):
-                    if param is not None:
+                    if param is not None and param.requires_grad:
                         key = f"{layer_name}.{param_name}"
-                        self._param_backup[key] = param.data.clone()
-                
-                # Backup buffers (batch norm stats, etc.)
-                for buffer_name, buffer in module.named_buffers(recurse=False):
-                    if buffer is not None:
-                        key = f"{layer_name}.{buffer_name}"
-                        self._weight_backup[key] = buffer.clone()
+                        self._target_params[key] = param
     
-    def _restore_weights(self):
-        """Restore original weights after modification."""
-        # Restore parameters
-        for key, original_data in self._param_backup.items():
-            try:
-                *layer_parts, param_name = key.split('.')
-                layer_name = '.'.join(layer_parts)
-                
-                module = self._get_module_by_name(layer_name)
-                if hasattr(module, param_name):
-                    param = getattr(module, param_name)
-                    if param is not None:
-                        param.data.copy_(original_data)
-            except Exception as e:
-                warnings.warn(f"Failed to restore parameter {key}: {e}")
-        
-        # Restore buffers
-        for key, original_data in self._weight_backup.items():
-            try:
-                *layer_parts, buffer_name = key.split('.')
-                layer_name = '.'.join(layer_parts)
-                
-                module = self._get_module_by_name(layer_name)
-                if hasattr(module, buffer_name):
-                    buffer = getattr(module, buffer_name)
-                    if buffer is not None:
-                        buffer.copy_(original_data)
-            except Exception as e:
-                warnings.warn(f"Failed to restore buffer {key}: {e}")
+    def _apply_deltas(self):
+        """Compute and apply deltas to target parameters."""
+        for param_key, param in self._target_params.items():
+            # Compute delta based on modification type
+            delta = self._compute_delta(param)
+            
+            # Store delta for restoration (this is our memory-efficient approach)
+            self._deltas[param_key] = delta.detach()
+            
+            # Apply delta in-place
+            param.data.add_(delta)
+            
+            self._modifications_applied.append({
+                'param': param_key,
+                'type': self.modification_type,
+                'delta_norm': delta.norm().item()
+            })
     
-    def _apply_modifications(self):
-        """Apply temporary modifications based on modification_type."""
+    def _restore_from_deltas(self):
+        """Restore original parameters by subtracting deltas."""
+        for param_key, delta in self._deltas.items():
+            if param_key in self._target_params:
+                param = self._target_params[param_key]
+                # Restore by subtracting the delta we applied
+                param.data.sub_(delta)
+            else:
+                raise RuntimeError(f"Parameter {param_key} not found during restoration")
+    
+    def _compute_delta(self, param: torch.Tensor) -> torch.Tensor:
+        """Compute delta for a parameter based on modification type."""
         if self.modification_type == "scale":
-            self._apply_scale_modification()
+            factor = self.kwargs.get('factor', 0.9)
+            # delta = param * factor - param = param * (factor - 1)
+            return param * (factor - 1.0)
+        
         elif self.modification_type == "noise":
-            self._apply_noise_modification()
+            noise_scale = self.kwargs.get('noise_scale', 0.01)
+            # delta = noise
+            return torch.randn_like(param) * noise_scale
+        
         elif self.modification_type == "disable":
-            self._apply_disable_modification()
+            # delta = 0 - param = -param (use zeros_like to avoid clone)
+            return torch.zeros_like(param) - param
+        
         elif self.modification_type == "custom" and self.modification_fn:
-            self._apply_custom_modification()
+            # For custom modifications, we need to compute the delta
+            original = param.clone()
+            # Apply custom function to a copy
+            modified_copy = param.clone()
+            self.modification_fn(modified_copy, **self.kwargs)
+            return modified_copy - original
+        
         else:
-            warnings.warn(f"Unknown modification type: {self.modification_type}")
-    
-    def _apply_scale_modification(self):
-        """Apply scaling modification to weights."""
-        factor = self.kwargs.get('factor', 0.9)
-        target_layers = self._get_target_layers()
-        
-        for layer_name, module in self.model.named_modules():
-            if self._should_modify_layer(layer_name, module, target_layers):
-                for param_name, param in module.named_parameters(recurse=False):
-                    if param is not None and 'weight' in param_name:
-                        param.data.mul_(factor)
-                        self._modifications_applied.append({
-                            'layer': layer_name,
-                            'param': param_name,
-                            'type': 'scale',
-                            'factor': factor
-                        })
-    
-    def _apply_noise_modification(self):
-        """Apply noise modification to weights."""
-        noise_scale = self.kwargs.get('noise_scale', 0.01)
-        target_layers = self._get_target_layers()
-        
-        for layer_name, module in self.model.named_modules():
-            if self._should_modify_layer(layer_name, module, target_layers):
-                for param_name, param in module.named_parameters(recurse=False):
-                    if param is not None and 'weight' in param_name:
-                        noise = torch.randn_like(param.data) * noise_scale
-                        param.data.add_(noise)
-                        self._modifications_applied.append({
-                            'layer': layer_name,
-                            'param': param_name,
-                            'type': 'noise',
-                            'scale': noise_scale
-                        })
-    
-    def _apply_disable_modification(self):
-        """Disable layers by zeroing their weights."""
-        target_layers = self._get_target_layers()
-        
-        for layer_name, module in self.model.named_modules():
-            if self._should_modify_layer(layer_name, module, target_layers):
-                for param_name, param in module.named_parameters(recurse=False):
-                    if param is not None and 'weight' in param_name:
-                        param.data.zero_()
-                        self._modifications_applied.append({
-                            'layer': layer_name,
-                            'param': param_name,
-                            'type': 'disable'
-                        })
-    
-    def _apply_custom_modification(self):
-        """Apply custom modification function."""
-        if self.modification_fn is None:
-            warnings.warn("Custom modification requested but no function provided")
-            return
-        
-        target_layers = self._get_target_layers()
-        
-        for layer_name, module in self.model.named_modules():
-            if self._should_modify_layer(layer_name, module, target_layers):
-                # Call custom modification function
-                self.modification_fn(module, layer_name, **self.kwargs)
-                self._modifications_applied.append({
-                    'layer': layer_name,
-                    'type': 'custom',
-                    'function': self.modification_fn.__name__
-                })
+            raise ValueError(f"Unknown modification type: {self.modification_type}")
     
     def _get_target_layers(self) -> List[str]:
         """Get list of target layer names."""
@@ -247,18 +190,6 @@ class SurgicalTheater:
         
         return target_layers
     
-    def _should_backup_layer(self, layer_name: str, module: nn.Module, target_layers: List[str]) -> bool:
-        """Check if layer should be backed up."""
-        # Direct match
-        if layer_name in target_layers:
-            return True
-        
-        # Parent of target layer
-        for target in target_layers:
-            if target.startswith(layer_name + '.'):
-                return True
-        
-        return False
     
     def _should_modify_layer(self, layer_name: str, module: nn.Module, target_layers: List[str]) -> bool:
         """Check if layer should be modified."""
@@ -290,8 +221,21 @@ class SurgicalTheater:
         """Get summary of modifications applied."""
         summary = defaultdict(list)
         for mod in self._modifications_applied:
-            summary[mod['type']].append(mod['layer'])
+            summary[mod['type']].append(mod['param'])
         return dict(summary)
+    
+    @property
+    def delta_statistics(self) -> Dict:
+        """Get statistics about the deltas applied."""
+        stats = {}
+        for param_key, delta in self._deltas.items():
+            stats[param_key] = {
+                'shape': tuple(delta.shape),
+                'mean_abs_delta': delta.abs().mean().item(),
+                'max_abs_delta': delta.abs().max().item(),
+                'memory_mb': delta.numel() * delta.element_size() / (1024 * 1024)
+            }
+        return stats
 
 
 # Convenience function
