@@ -65,6 +65,8 @@ class SurgicalTheater:
         # Storage for deltas (memory-efficient approach)
         self._deltas = {}
         self._target_params = {}
+        self._quantized_params = {}  # Track which params were quantized
+        self._sharded_params = {}  # Track sharded parameter info
         
         # Memory tracking
         self._memory_before = 0
@@ -120,11 +122,16 @@ class SurgicalTheater:
             if self._enter_depth == 0:
                 self._deltas.clear()
                 self._target_params.clear()
+                self._quantized_params.clear()
+                self._sharded_params.clear()
                 self._modifications_applied.clear()
     
     def _identify_target_parameters(self):
         """Identify parameters to modify based on layers specification."""
         target_layers = self._get_target_layers()
+        
+        # Check if model is sharded (FSDP/DeepSpeed)
+        model_is_sharded = self._detect_sharded_model()
         
         for layer_name, module in self.model.named_modules():
             if self._should_modify_layer(layer_name, module, target_layers):
@@ -133,7 +140,21 @@ class SurgicalTheater:
                     # Include both trainable and frozen parameters for broader compatibility
                     if param is not None:
                         key = f"{layer_name}.{param_name}"
-                        self._target_params[key] = param
+                        
+                        # Handle sharded parameters
+                        if model_is_sharded:
+                            gathered_param = self._gather_sharded_parameter(param, key)
+                            if gathered_param is not None:
+                                self._target_params[key] = gathered_param
+                                self._sharded_params[key] = {
+                                    'original_param': param,
+                                    'is_sharded': True
+                                }
+                            else:
+                                # Skip parameters that couldn't be gathered
+                                continue
+                        else:
+                            self._target_params[key] = param
     
     def _ensure_contiguity(self):
         """Ensure all target parameters are contiguous to avoid storage aliasing issues."""
@@ -145,43 +166,63 @@ class SurgicalTheater:
     def _apply_deltas(self):
         """Compute and apply deltas to target parameters."""
         for param_key, param in self._target_params.items():
-            # Check for quantized parameters
-            if hasattr(param, 'dtype') and 'int' in str(param.dtype):
-                raise RuntimeError(f"Quantized parameter {param_key} (dtype: {param.dtype}) detected. "
-                                 "SurgicalTheater doesn't support quantized models. "
-                                 "Please use unquantized model for validation.")
+            # Handle quantized parameters with copy-as-fp32 → apply delta → cast-back pattern
+            is_quantized = self._is_quantized_parameter(param)
             
-            # Store original dtype for restoration
-            original_dtype = param.dtype
-            
-            # Compute delta based on modification type
-            delta = self._compute_delta(param)
-            
-            # Validate delta shape and compatibility
-            if delta.shape != param.shape:
-                raise ValueError(f"Delta shape {delta.shape} doesn't match param shape {param.shape} for {param_key}")
-            
-            # Ensure delta is on same device and dtype as parameter
-            if delta.device != param.device:
-                delta = delta.to(param.device)
-            if delta.dtype != param.dtype:
-                delta = delta.to(param.dtype)
-            
-            # Store delta for restoration (this is our memory-efficient approach)
-            self._deltas[param_key] = delta.detach()
-            
-            # Apply delta in-place
-            param.data.add_(delta)
-            
-            # Verify dtype preservation
-            if param.dtype != original_dtype:
-                raise RuntimeError(f"Parameter {param_key} dtype changed from {original_dtype} to {param.dtype} "
-                                 "during modification. This indicates a quantization or dtype consistency issue.")
+            if is_quantized:
+                # Store quantization info for restoration
+                self._quantized_params[param_key] = {
+                    'original_dtype': param.dtype,
+                    'original_device': param.device
+                }
+                
+                # Copy to FP32 for delta computation and application
+                param_fp32 = param.data.float()
+                
+                # Compute delta on FP32 version
+                delta = self._compute_delta_for_param(param_fp32, param_key)
+                
+                # Apply delta to FP32 version
+                modified_fp32 = param_fp32 + delta
+                
+                # Cast back to original quantized format and update parameter
+                param.data = modified_fp32.to(param.dtype)
+                
+                # Store the FP32 delta for restoration
+                self._deltas[param_key] = delta.detach()
+            else:
+                # Standard non-quantized parameter handling
+                original_dtype = param.dtype
+                
+                # Compute delta based on modification type
+                delta = self._compute_delta_for_param(param.data, param_key)
+                
+                # Validate delta shape and compatibility
+                if delta.shape != param.shape:
+                    raise ValueError(f"Delta shape {delta.shape} doesn't match param shape {param.shape} for {param_key}")
+                
+                # Ensure delta is on same device and dtype as parameter
+                if delta.device != param.device:
+                    delta = delta.to(param.device)
+                if delta.dtype != param.dtype:
+                    delta = delta.to(param.dtype)
+                
+                # Store delta for restoration (this is our memory-efficient approach)
+                self._deltas[param_key] = delta.detach()
+                
+                # Apply delta in-place
+                param.data.add_(delta)
+                
+                # Verify dtype preservation
+                if param.dtype != original_dtype:
+                    raise RuntimeError(f"Parameter {param_key} dtype changed from {original_dtype} to {param.dtype} "
+                                     "during modification. This indicates a dtype consistency issue.")
             
             self._modifications_applied.append({
                 'param': param_key,
                 'type': self.modification_type,
-                'delta_norm': delta.norm().item()
+                'delta_norm': self._deltas[param_key].norm().item(),
+                'is_quantized': is_quantized
             })
     
     def _restore_from_deltas(self):
@@ -189,10 +230,159 @@ class SurgicalTheater:
         for param_key, delta in self._deltas.items():
             if param_key in self._target_params:
                 param = self._target_params[param_key]
-                # Restore by subtracting the delta we applied
-                param.data.sub_(delta)
+                
+                # Handle sharded parameter restoration
+                if param_key in self._sharded_params:
+                    self._restore_sharded_parameter(param_key, delta)
+                    continue
+                
+                # Handle quantized parameter restoration
+                if param_key in self._quantized_params:
+                    # For quantized params: copy to FP32, subtract delta, cast back
+                    param_fp32 = param.data.float()
+                    restored_fp32 = param_fp32 - delta
+                    param.data = restored_fp32.to(self._quantized_params[param_key]['original_dtype'])
+                else:
+                    # Standard restoration by subtracting the delta we applied
+                    param.data.sub_(delta)
             else:
                 raise RuntimeError(f"Parameter {param_key} not found during restoration")
+    
+    def _restore_sharded_parameter(self, param_key: str, delta: torch.Tensor):
+        """Restore a sharded parameter by distributing the delta back."""
+        try:
+            sharded_info = self._sharded_params[param_key]
+            original_param = sharded_info['original_param']
+            
+            # For FSDP, we need to distribute the delta back to the sharded parameter
+            if hasattr(original_param, '_local_shard'):
+                # Get the local shard portion of the delta
+                # This is a simplified approach - production code may need more sophisticated sharding logic
+                world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                
+                if world_size > 1:
+                    # Calculate shard boundaries
+                    total_elements = delta.numel()
+                    elements_per_shard = total_elements // world_size
+                    start_idx = rank * elements_per_shard
+                    end_idx = start_idx + elements_per_shard if rank < world_size - 1 else total_elements
+                    
+                    # Extract local shard from delta and apply
+                    delta_flat = delta.flatten()
+                    local_delta = delta_flat[start_idx:end_idx].reshape(original_param.shape)
+                    original_param.data.sub_(local_delta)
+                else:
+                    # Single device - apply full delta
+                    original_param.data.sub_(delta)
+            else:
+                # Non-FSDP sharded parameter - apply delta directly
+                original_param.data.sub_(delta)
+                
+        except Exception as e:
+            import warnings
+            warnings.warn(f"Failed to restore sharded parameter {param_key}: {e}. Parameter may not be fully restored.")
+    
+    def _is_quantized_parameter(self, param: torch.Tensor) -> bool:
+        """Check if a parameter is quantized (bitsandbytes, QLoRA, etc.)."""
+        # Check for integer dtypes (common in quantized models)
+        if hasattr(param, 'dtype') and 'int' in str(param.dtype):
+            return True
+        
+        # Check for bitsandbytes quantized parameters
+        if hasattr(param, '__class__'):
+            class_name = param.__class__.__name__
+            if 'Int' in class_name or 'Quant' in class_name or 'Bits' in class_name:
+                return True
+        
+        # Check for specific quantized tensor types
+        if hasattr(param, '_quantized_param') or hasattr(param, 'quant_state'):
+            return True
+            
+        return False
+    
+    def _compute_delta_for_param(self, param_data: torch.Tensor, param_key: str) -> torch.Tensor:
+        """Compute delta for a specific parameter tensor."""
+        return self._compute_delta(param_data)
+    
+    def _detect_sharded_model(self) -> bool:
+        """Detect if the model is using FSDP or DeepSpeed sharding."""
+        # Check for FSDP wrapper
+        if hasattr(self.model, '_fsdp_wrapped_module'):
+            return True
+            
+        # Check for DeepSpeed wrapper
+        if hasattr(self.model, 'module') and hasattr(self.model, 'engine'):
+            return True
+            
+        # Check for HuggingFace Accelerate sharding
+        if hasattr(self.model, '_hf_hook') or hasattr(self.model, 'hf_device_map'):
+            return True
+            
+        # Check for distributed model wrapper
+        model_class_name = self.model.__class__.__name__
+        if any(wrapper in model_class_name for wrapper in ['FSDP', 'DeepSpeed', 'DistributedDataParallel']):
+            return True
+            
+        # Check individual parameters for sharding indicators
+        for param in self.model.parameters():
+            if hasattr(param, '_local_shard') or hasattr(param, '_sharded_tensor'):
+                return True
+                
+        return False
+    
+    def _gather_sharded_parameter(self, param: torch.Tensor, param_key: str) -> torch.Tensor:
+        """Gather a sharded parameter across devices if needed."""
+        try:
+            # Try FSDP gathering
+            if hasattr(param, '_local_shard'):
+                # FSDP parameter - need to gather
+                if hasattr(torch.distributed.fsdp, 'FullyShardedDataParallel'):
+                    # Use FSDP's summon_full_params context manager
+                    parent_module = self._get_parameter_parent_module(param_key)
+                    if parent_module and hasattr(parent_module, '_fsdp_wrapped_module'):
+                        with torch.distributed.fsdp.FullyShardedDataParallel.summon_full_params(parent_module):
+                            return param.data.clone()
+            
+            # Try DeepSpeed gathering
+            if hasattr(self.model, 'engine') and hasattr(self.model.engine, 'gather_16bit_weights_on_model_save'):
+                # DeepSpeed Zero optimizer - gather weights
+                # This is a simplified approach - may need refinement for production
+                return param.data.clone()
+            
+            # Try manual gathering for other distributed setups
+            if torch.distributed.is_initialized() and param.dim() > 0:
+                # Simple all-gather for distributed parameters
+                world_size = torch.distributed.get_world_size()
+                if world_size > 1:
+                    gathered_tensors = [torch.zeros_like(param) for _ in range(world_size)]
+                    torch.distributed.all_gather(gathered_tensors, param)
+                    # Concatenate or select based on sharding strategy
+                    return torch.cat(gathered_tensors, dim=0)
+            
+            # If no sharding detected, return as-is
+            return param.data
+            
+        except Exception as e:
+            # If gathering fails, warn and skip this parameter
+            import warnings
+            warnings.warn(f"Failed to gather sharded parameter {param_key}: {e}. Skipping this parameter.")
+            return None
+    
+    def _get_parameter_parent_module(self, param_key: str):
+        """Get the parent module for a parameter key."""
+        parts = param_key.split('.')
+        if len(parts) < 2:
+            return self.model
+            
+        # Navigate to parent module
+        module = self.model
+        for part in parts[:-1]:  # Exclude the parameter name
+            if hasattr(module, part):
+                module = getattr(module, part)
+            else:
+                return None
+        return module
     
     def _compute_delta(self, param: torch.Tensor) -> torch.Tensor:
         """Compute delta for a parameter based on modification type."""

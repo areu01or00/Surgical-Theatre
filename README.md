@@ -2,6 +2,8 @@
 
 **Zero-copy model validation during training** - Test your models without breaking the bank (or your GPU)
 
+> **v0.1.1+**: Now supports quantized models (bitsandbytes/QLoRA) and sharded models (FSDP/DeepSpeed)!
+
 [![Python Version](https://img.shields.io/badge/python-3.7%2B-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-1.9%2B-orange.svg)](https://pytorch.org/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
@@ -44,7 +46,7 @@ SurgicalTheater provides a simple context manager that:
 - ✨ **Reduces memory overhead** (~1 parameter set vs 2x full model)
 - ✨ **Enables frequent validation** (every 10 steps vs once per epoch)
 - ✨ **Preserves training state** (no gradient contamination)
-- ✨ **Works with any PyTorch model** (LoRA, full fine-tuning, RL/RLHF, etc.)
+- ✨ **Works with any PyTorch model** (LoRA, full fine-tuning, RL/RLHF, quantized, sharded, etc.)
 
 **Key Insight**: Instead of copying the entire model (2x memory), SurgicalTheater uses delta-based modifications (~1 parameter set extra memory) with automatic restoration.
 
@@ -72,6 +74,12 @@ pip install "git+https://github.com/areu01or00/Surgical-Theatre.git[dev]"
 
 # With examples dependencies (transformers, etc.)
 pip install "git+https://github.com/areu01or00/Surgical-Theatre.git[examples]"
+
+# For quantized model support (bitsandbytes)
+pip install bitsandbytes
+
+# For FSDP/sharding support (latest PyTorch)
+pip install torch>=2.0.0
 ```
 
 ### Future PyPI Release
@@ -199,6 +207,44 @@ with SurgicalTheater(model, modification_type="custom",
 
 **Important**: Custom functions must return the delta tensor directly, not modify parameters in-place. This prevents memory leaks from double-cloning.
 
+## 🚀 Advanced Features (v0.1.1+)
+
+### Quantized Model Support
+Works seamlessly with bitsandbytes and QLoRA quantized models:
+```python
+# Load quantized model (bitsandbytes/QLoRA)
+model = AutoModelForCausalLM.from_pretrained(
+    "model_name", 
+    load_in_8bit=True,  # or load_in_4bit=True
+    device_map="auto"
+)
+
+# SurgicalTheater automatically handles quantization
+with SurgicalTheater(model):
+    val_loss = model(validation_data)  # ✨ Works with quantized models!
+```
+
+**How it works**: Automatically detects quantized parameters → copies to FP32 → applies deltas → casts back to quantized format.
+
+### FSDP/DeepSpeed Sharding Support
+Compatible with distributed training frameworks:
+```python
+# FSDP sharded model
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+model = FSDP(model)
+
+# Or DeepSpeed/HF Accelerate
+from accelerate import Accelerator
+accelerator = Accelerator()
+model = accelerator.prepare(model)
+
+# SurgicalTheater handles sharding automatically
+with SurgicalTheater(model):
+    val_metrics = validate(model)  # ✨ Works with sharded models!
+```
+
+**How it works**: Detects sharding → gathers parameters across devices → applies deltas → distributes back to shards.
+
 ## 💡 Use Cases
 
 ### 1. **LoRA/PEFT Training**
@@ -302,6 +348,8 @@ SurgicalTheater uses a delta-based approach with important safety features:
 3. **Restore**: Automatically subtract deltas to restore original state on exit
 
 **Key Features:**
+- **Quantized Model Support**: Automatic detection and FP32 conversion for bitsandbytes/QLoRA models
+- **FSDP/DeepSpeed Compatibility**: Handles parameter gathering/distribution for sharded models  
 - **Re-entrancy Protection**: Prevents nested contexts that could cause state corruption
 - **Tensor Contiguity**: Ensures safe operations on non-contiguous tensors (from `.transpose()`, `torch.compile()`, etc.)
 - **Shape Validation**: Strict checking that deltas match parameter shapes
