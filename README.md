@@ -50,13 +50,34 @@ SurgicalTheater provides a simple context manager that:
 
 ## 📦 Installation
 
+### Install from GitHub (Recommended)
+
 ```bash
-pip install surgical-theater
+pip install git+https://github.com/areu01or00/Surgical-Theatre.git
 ```
 
-For development:
+### Local Development Install
+
 ```bash
-pip install surgical-theater[dev]
+git clone https://github.com/areu01or00/Surgical-Theatre.git
+cd Surgical-Theatre
+pip install -e .
+```
+
+### With optional dependencies
+
+```bash
+# With development tools
+pip install "git+https://github.com/areu01or00/Surgical-Theatre.git[dev]"
+
+# With examples dependencies (transformers, etc.)
+pip install "git+https://github.com/areu01or00/Surgical-Theatre.git[examples]"
+```
+
+### Future PyPI Release
+```bash
+# This will be available once published to PyPI
+pip install surgical-theater
 ```
 
 ## 🎯 Quick Start
