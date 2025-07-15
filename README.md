@@ -316,11 +316,20 @@ This is **~650,000x more memory efficient** than creating model copies!
 
 ## 📊 Benchmarks
 
-| Method | Memory Usage | Time | Safety |
-|--------|--------------|------|--------|
-| Deepcopy | 🔴 2x model size | Slow | ✅ Safe |
-| In-place modification | 🟢 No extra | Fast | ❌ Risky |
-| **SurgicalTheater** | 🟢 ~32KB | Fast | ✅ Safe |
+| Validation Method | Memory Usage | Time | Safety | Description |
+|------------------|--------------|------|--------|-------------|
+| **deepcopy(model)** | 🔴 2x model size | Slow | ✅ Safe | Creates full copy (28GB + 28GB = 56GB) |
+| **torch.save/load** | 🟡 Disk I/O | Very Slow | ✅ Safe | Saves 28GB to disk, then reloads |
+| **Risky eval()** | 🟢 No extra | Fast | ❌ Risky | `model.eval()` directly (gradient contamination) |
+| **SurgicalTheater** | 🟢 ~32KB | Fast | ✅ Safe | **Our approach**: Minimal backup + isolation |
+
+### Real Memory Comparison (7B Model):
+
+| Method | GPU Memory Needed | Works on 24GB GPU? |
+|--------|------------------|-------------------|
+| Model only | 20GB | ✅ Yes |
+| + deepcopy validation | 40GB | ❌ **Crashes** |
+| + SurgicalTheater validation | 20GB + 32KB | ✅ **Works perfectly** |
 
 ## 🤝 Contributing
 
