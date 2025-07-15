@@ -73,15 +73,17 @@ class SurgicalTheater:
         # Modification tracking
         self._modifications_applied = []
         
-        # Thread safety / re-entrancy protection
-        self._entered = False
+        # Thread safety / re-entrancy protection (allow depth=1)
+        self._enter_depth = 0
     
     def __enter__(self):
         """Enter context and apply temporary modifications."""
-        # Check for re-entrancy
-        if self._entered:
-            raise RuntimeError("SurgicalTheater is not re-entrant. Nested contexts are not supported.")
-        self._entered = True
+        # Check for nested re-entrancy (allow depth=1)
+        self._enter_depth = getattr(self, "_enter_depth", 0) + 1
+        if self._enter_depth > 1:
+            self._enter_depth -= 1  # Reset on error
+            raise RuntimeError("Nested SurgicalTheater instances on the same object aren't supported. "
+                               "Use depth-1 or different theatre objects.")
         
         try:
             if self.track_memory:
@@ -98,7 +100,7 @@ class SurgicalTheater:
             
             return self
         except Exception:
-            self._entered = False
+            self._enter_depth -= 1  # Reset on error
             raise
     
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -113,13 +115,12 @@ class SurgicalTheater:
                 memory_after = self._get_memory_usage()
                 self._memory_saved = max(0, self._memory_before - memory_after)
             
-            # Clear storage to free memory
-            self._deltas.clear()
-            self._target_params.clear()
-            self._modifications_applied.clear()
-            
-            # Reset re-entrancy flag
-            self._entered = False
+            # Only clear storage when fully exiting (depth=0)
+            self._enter_depth -= 1
+            if self._enter_depth == 0:
+                self._deltas.clear()
+                self._target_params.clear()
+                self._modifications_applied.clear()
     
     def _identify_target_parameters(self):
         """Identify parameters to modify based on layers specification."""
@@ -144,6 +145,15 @@ class SurgicalTheater:
     def _apply_deltas(self):
         """Compute and apply deltas to target parameters."""
         for param_key, param in self._target_params.items():
+            # Check for quantized parameters
+            if hasattr(param, 'dtype') and 'int' in str(param.dtype):
+                raise RuntimeError(f"Quantized parameter {param_key} (dtype: {param.dtype}) detected. "
+                                 "SurgicalTheater doesn't support quantized models. "
+                                 "Please use unquantized model for validation.")
+            
+            # Store original dtype for restoration
+            original_dtype = param.dtype
+            
             # Compute delta based on modification type
             delta = self._compute_delta(param)
             
@@ -151,15 +161,22 @@ class SurgicalTheater:
             if delta.shape != param.shape:
                 raise ValueError(f"Delta shape {delta.shape} doesn't match param shape {param.shape} for {param_key}")
             
-            # Ensure delta is on same device as parameter
+            # Ensure delta is on same device and dtype as parameter
             if delta.device != param.device:
                 delta = delta.to(param.device)
+            if delta.dtype != param.dtype:
+                delta = delta.to(param.dtype)
             
             # Store delta for restoration (this is our memory-efficient approach)
             self._deltas[param_key] = delta.detach()
             
             # Apply delta in-place
             param.data.add_(delta)
+            
+            # Verify dtype preservation
+            if param.dtype != original_dtype:
+                raise RuntimeError(f"Parameter {param_key} dtype changed from {original_dtype} to {param.dtype} "
+                                 "during modification. This indicates a quantization or dtype consistency issue.")
             
             self._modifications_applied.append({
                 'param': param_key,
