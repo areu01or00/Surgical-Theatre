@@ -150,6 +150,7 @@ Result:     ✅ WORKS WELL!
 - Validate every 10 steps if desired
 - Catch overfitting immediately
 - Use budget hardware
+- **Safe & Reliable**: Robust error handling prevents silent weight corruption
 
 ## 🔧 Advanced Features
 
@@ -184,16 +185,19 @@ with SurgicalTheater(model, modification_type="noise", noise_scale=0.01):
 ### 4. Custom Modifications
 
 ```python
-def my_custom_modification(module, layer_name, **kwargs):
-    """Apply your own modifications."""
-    if hasattr(module, 'weight'):
-        module.weight.data *= kwargs.get('factor', 1.0)
+def my_custom_modification(param, **kwargs):
+    """Apply your own modifications - MUST return delta directly."""
+    factor = kwargs.get('factor', 1.0)
+    # Return the delta, not the modified parameter
+    return param * (factor - 1.0)  # delta = new_param - old_param
 
 with SurgicalTheater(model, modification_type="custom", 
                     modification_fn=my_custom_modification, 
                     factor=0.9):
     result = model(data)
 ```
+
+**Important**: Custom functions must return the delta tensor directly, not modify parameters in-place. This prevents memory leaks from double-cloning.
 
 ## 💡 Use Cases
 
@@ -291,11 +295,18 @@ with SurgicalTheater(model, layers=attention_layers, modification_type="scale", 
 
 ## 🏗️ How It Works
 
-SurgicalTheater uses a simple but powerful approach:
+SurgicalTheater uses a delta-based approach with important safety features:
 
 1. **Compute Delta**: Calculate minimal changes needed for modification (~1 parameter set)
-2. **Apply**: Apply deltas in-place to target parameters  
+2. **Apply**: Apply deltas in-place to target parameters with validation
 3. **Restore**: Automatically subtract deltas to restore original state on exit
+
+**Key Features:**
+- **Re-entrancy Protection**: Prevents nested contexts that could cause state corruption
+- **Tensor Contiguity**: Ensures safe operations on non-contiguous tensors (from `.transpose()`, `torch.compile()`, etc.)
+- **Shape Validation**: Strict checking that deltas match parameter shapes
+- **Device Consistency**: Automatic handling of cross-device operations
+- **Exception Safety**: Guaranteed restoration even if errors occur
 
 **Key Insight**: Instead of copying the entire model (20GB), we only store the deltas needed to undo modifications (~1-3GB for most use cases).
 
