@@ -38,7 +38,7 @@ model.load_state_dict(torch.load('temp.pt'))  # More disk I/O
 |--------|-------------|---------------|
 | **deepcopy(model)** | 20GB + 20GB = 40GB | ❌ Crashes on 24GB GPU |
 | **torch.save/load** | 20GB + disk I/O | ✅ Works but SLOW |
-| **SurgicalTheater** | 20GB + 32KB | ✅ Works and FAST |
+| **SurgicalTheater** | 20GB + ~1 param set | ✅ Works and FAST |
 
 ### The Solution
 
