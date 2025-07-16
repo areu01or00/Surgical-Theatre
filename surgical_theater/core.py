@@ -68,6 +68,7 @@ class SurgicalTheater:
         self._quantized_params = {}  # Track which params were quantized
         self._sharded_params = {}  # Track sharded parameter info
         self._requires_grad_cache = {}  # Cache requires_grad flags
+        self._training_mode_cache = None  # Cache training mode
         
         # Memory tracking
         self._memory_before = 0
@@ -95,8 +96,9 @@ class SurgicalTheater:
             # Identify target parameters
             self._identify_target_parameters()
             
-            # Cache requires_grad flags before modification
+            # Cache requires_grad flags and training mode before modification
             self._cache_requires_grad()
+            self._cache_training_mode()
             
             # Ensure tensor contiguity for safe delta operations
             self._ensure_contiguity()
@@ -117,6 +119,9 @@ class SurgicalTheater:
             
             # Restore requires_grad flags
             self._restore_requires_grad()
+            
+            # Restore training mode
+            self._restore_training_mode()
         except Exception as e:
             raise RuntimeError(f"Failed to restore model weights: {e}") from e
         finally:
@@ -133,6 +138,7 @@ class SurgicalTheater:
                 self._sharded_params.clear()
                 self._requires_grad_cache.clear()
                 self._modifications_applied.clear()
+                self._training_mode_cache = None
     
     def _identify_target_parameters(self):
         """Identify parameters to modify based on layers specification."""
@@ -174,6 +180,18 @@ class SurgicalTheater:
         for param_key, param in self._target_params.items():
             if param_key in self._requires_grad_cache:
                 param.requires_grad = self._requires_grad_cache[param_key]
+    
+    def _cache_training_mode(self):
+        """Cache the current training mode of the model."""
+        self._training_mode_cache = self.model.training
+    
+    def _restore_training_mode(self):
+        """Restore the cached training mode of the model."""
+        if self._training_mode_cache is not None:
+            if self._training_mode_cache:
+                self.model.train()
+            else:
+                self.model.eval()
     
     def _ensure_contiguity(self):
         """Ensure all target parameters are contiguous to avoid storage aliasing issues."""
