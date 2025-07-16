@@ -84,6 +84,9 @@ python examples/basic_usage.py
 
 # Run LoRA integration examples
 python examples/lora_integration.py
+
+# Run advanced features demo (quantized/sharded models)
+python examples/advanced_features.py
 ```
 
 ### Building
@@ -100,6 +103,11 @@ pip install dist/surgical_theater-*.whl
 - **`surgical_theater/core.py`**: Main SurgicalTheater implementation with weight backup/restore logic
 - **`examples/basic_usage.py`**: 6 comprehensive examples covering validation, hyperparameter testing, ablation studies
 - **`examples/lora_integration.py`**: LoRA-specific examples showing memory comparisons
+- **`examples/advanced_features.py`**: Demonstrates quantized model support and FSDP/DeepSpeed compatibility
+- **`tests/test_basic.py`**: Core functionality tests including memory bounds verification
+- **`tests/test_bnb_int4.py`**: Quantized model support tests (bitsandbytes/QLoRA)
+- **`tests/test_fsdp.py`**: FSDP/DeepSpeed sharding compatibility tests
+- **`.github/workflows/test.yml`**: CI/CD pipeline with matrix testing across Python/PyTorch versions
 - **`pyproject.toml`**: Modern Python packaging configuration with dev/examples optional dependencies
 
 ## Recent Critical Improvements (Based on Reviewer Feedback)
@@ -113,18 +121,33 @@ The codebase has been significantly improved based on expert review:
 4. **Tensor aliasing**: Added contiguity enforcement to prevent storage view issues
 5. **Error handling**: Changed from warnings to RuntimeError for restoration failures
 
-### Latest Improvements (v0.1.1)
+### Latest Improvements (v0.1.1+)
 6. **Flexible re-entrancy**: Changed from strict blocking to depth=1 allowance using `_enter_depth` counter
-7. **Quantization detection**: Added runtime error for quantized models with helpful error messages
-8. **Dtype preservation**: Enhanced dtype consistency checking during delta operations
+7. **Quantized model support**: Full support for bitsandbytes/QLoRA with FP32 copy-apply-cast pattern
+8. **FSDP/DeepSpeed sharding**: Automatic detection and parameter gathering for distributed models
+9. **Dtype preservation**: Enhanced dtype consistency checking during delta operations
+
+### Critical Production Fixes (v0.2.0)
+10. **RAM spike prevention**: Deltas stored in original dtype (int8/int4) not FP32
+11. **CPU offloading safety**: Skip gather path for CPU-offloaded bnb parameters
+12. **Gradient flow preservation**: Cache/restore `requires_grad` flags via `_requires_grad_cache`
+13. **Embedding layer handling**: Full-copy fallback for 2-D tensors with wrong shard shapes
+14. **Multi-node stability**: All distributed ops use explicit `group=` parameter
+15. **Comprehensive testing**: GitHub Actions matrix ensures memory claims stay within ±5%
 
 ### Key Implementation Details
 - **Delta-based restoration**: `param.data.add_(delta)` then `param.data.sub_(delta)`
+- **Quantized parameter handling**: Auto-detect → copy to FP32 → apply delta → cast back → store delta in original dtype
+- **Custom int8 addition**: `_custom_add_int8_inplace()` for bitsandbytes parameters
+- **Sharded parameter gathering**: FSDP/DeepSpeed detection → gather → modify → distribute back
+- **CPU offload handling**: Skip gather for CPU-offloaded bnb params to prevent crashes
+- **Gradient preservation**: `_cache_requires_grad()` and `_restore_requires_grad()` methods
+- **Embedding layer safety**: 2-D tensor detection with full-copy fallback
+- **Distributed synchronization**: All ops use explicit `group=` and barriers
 - **Shape validation**: Strict delta shape checking before application
 - **Device handling**: Automatic tensor device consistency
 - **Dtype preservation**: Automatic dtype casting for deltas and validation
 - **Re-entrancy depth**: `_enter_depth` counter allows depth=1 nesting
-- **Quantization safety**: Runtime detection and blocking of quantized parameters
 - **Scalar broadcasting**: Proper `torch.as_tensor()` usage for cross-device scalars
 
 ### Custom Modification API
@@ -154,7 +177,35 @@ SurgicalTheater validation: 20GB model + ~2GB deltas = ~22GB total
 - Works with LoRA, PEFT, full fine-tuning, and RL training
 - Supports both automatic layer detection (attention layers) and manual layer specification
 - Thread-safe and exception-safe through proper context manager implementation
-- **Quantized models**: Explicitly detected and blocked with helpful error messages (use unquantized for validation)
+- **Quantized models**: Full support for bitsandbytes/QLoRA with automatic FP32 conversion
+- **Sharded models**: Compatible with FSDP, DeepSpeed, and HuggingFace Accelerate
 - Handles compiled models and non-contiguous tensors with automatic contiguity enforcement
 - Auto-detection uses deterministic ordering for reproducible results
 - Allows depth=1 re-entrancy for common nested usage patterns
+
+## Critical Architecture Components (v0.1.1+)
+
+### Quantization Support
+- `_is_quantized_parameter()`: Detects bitsandbytes/QLoRA parameters
+- `_quantized_params`: Tracks original dtypes for restoration
+- Copy-as-FP32 → apply delta → cast-back pattern prevents quantization corruption
+
+### Sharding Support  
+- `_detect_sharded_model()`: Auto-detects FSDP/DeepSpeed/Accelerate sharding
+- `_gather_sharded_parameter()`: Gathers distributed parameters for modification
+- `_restore_sharded_parameter()`: Distributes deltas back to shards correctly
+- `_sharded_params`: Tracks sharding metadata for proper restoration
+
+### Memory Efficiency
+- Delta storage uses ~1 parameter set vs 2x full model for deepcopy
+- Quantized models: Deltas stored in original dtype (int8/int4) to prevent RAM spikes
+- Automatic cleanup on context exit (even with exceptions)
+- Memory tracking with `total_delta_memory_mb` property for monitoring
+- CI/CD enforces memory usage stays within ±5% of README claims
+
+### Testing Strategy
+- **Basic tests**: Core functionality, memory bounds, gradient flow preservation
+- **Quantized tests**: bitsandbytes/QLoRA support, CPU offloading, dtype preservation
+- **FSDP tests**: Sharding detection, parameter gathering, embedding layers, multi-node
+- **GitHub Actions**: Matrix testing across Python 3.8-3.11, PyTorch 2.0-2.2, with bitsandbytes
+- **Memory verification**: Automated checks that delta memory matches ~1 parameter set claim

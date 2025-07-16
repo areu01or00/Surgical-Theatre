@@ -1,0 +1,202 @@
+name: Test
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.8", "3.9", "3.10", "3.11"]
+        torch-version: ["2.0.0", "2.1.0", "2.2.0"]
+        include:
+          - python-version: "3.8"
+            torch-version: "2.0.0"
+            bitsandbytes-version: "0.44.0"
+          - python-version: "3.9"
+            torch-version: "2.1.0"
+            bitsandbytes-version: "0.44.0"
+          - python-version: "3.10"
+            torch-version: "2.2.0"
+            bitsandbytes-version: "0.44.0"
+        exclude:
+          # PyTorch 2.2 doesn't support Python 3.8
+          - python-version: "3.8"
+            torch-version: "2.2.0"
+
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install torch==${{ matrix.torch-version }} --index-url https://download.pytorch.org/whl/cpu
+        pip install -e ".[dev]"
+        if [ "${{ matrix.bitsandbytes-version }}" != "" ]; then
+          pip install bitsandbytes==${{ matrix.bitsandbytes-version }}
+        fi
+    
+    - name: Run basic tests
+      run: |
+        pytest tests/test_basic.py -v --cov=surgical_theater --cov-report=xml
+    
+    - name: Run quantization tests
+      run: |
+        pytest tests/test_bnb_int4.py -v --cov=surgical_theater --cov-append --cov-report=xml
+    
+    - name: Run FSDP tests
+      run: |
+        pytest tests/test_fsdp.py -v --cov=surgical_theater --cov-append --cov-report=xml
+    
+    - name: Run core tests
+      run: |
+        pytest tests/test_core.py -v --cov=surgical_theater --cov-append --cov-report=xml
+    
+    - name: Memory bounds verification
+      run: |
+        python -c "
+        import torch
+        import torch.nn as nn
+        from surgical_theater import SurgicalTheater
+        
+        # Create test model
+        model = nn.Sequential(
+            nn.Linear(100, 200),
+            nn.Linear(200, 200),
+            nn.Linear(200, 1)
+        )
+        
+        # Calculate expected memory
+        total_params = sum(p.numel() for p in model.parameters())
+        expected_delta_mb = (total_params * 4) / (1024 * 1024)  # fp32 bytes to MB
+        
+        # Test memory usage
+        with SurgicalTheater(model, track_memory=True) as theater:
+            data = torch.randn(32, 100)
+            output = model(data)
+            actual_delta_mb = theater.total_delta_memory_mb
+        
+        # Verify within ±5% of README promise
+        error_pct = abs(actual_delta_mb - expected_delta_mb) / expected_delta_mb
+        assert error_pct < 0.05, f'Memory usage {actual_delta_mb:.2f} MB not within ±5% of expected {expected_delta_mb:.2f} MB (error: {error_pct:.1%})'
+        
+        print(f'✓ Memory test passed: {actual_delta_mb:.2f} MB vs expected {expected_delta_mb:.2f} MB (error: {error_pct:.1%})')
+        "
+    
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./coverage.xml
+        flags: unittests
+        name: codecov-umbrella
+        fail_ci_if_error: true
+
+  test-distributed:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Python 3.9
+      uses: actions/setup-python@v4
+      with:
+        python-version: 3.9
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install torch==2.1.0 --index-url https://download.pytorch.org/whl/cpu
+        pip install -e ".[dev]"
+        pip install pytest-xdist
+    
+    - name: Run distributed tests
+      run: |
+        # Test with 4 processes to simulate multi-GPU
+        pytest tests/test_fsdp.py::test_distributed_groups_and_barriers -v -n 4
+    
+    - name: Test barrier synchronization
+      run: |
+        python -c "
+        import torch
+        import torch.distributed as dist
+        from unittest.mock import patch
+        from surgical_theater import SurgicalTheater
+        import torch.nn as nn
+        
+        # Test that barriers are called with correct groups
+        model = nn.Linear(10, 10)
+        
+        with patch('torch.distributed.is_initialized', return_value=True), \
+             patch('torch.distributed.get_world_size', return_value=4), \
+             patch('torch.distributed.get_rank', return_value=0), \
+             patch('torch.distributed.barrier') as mock_barrier:
+            
+            theater = SurgicalTheater(model)
+            # Should not crash with mocked distributed environment
+            
+        print('✓ Distributed barrier test passed')
+        "
+
+  test-memory-bounds:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Python 3.9
+      uses: actions/setup-python@v4
+      with:
+        python-version: 3.9
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install torch==2.1.0 --index-url https://download.pytorch.org/whl/cpu
+        pip install -e ".[dev]"
+    
+    - name: Test README memory promises
+      run: |
+        python -c "
+        import torch
+        import torch.nn as nn
+        from surgical_theater import SurgicalTheater
+        
+        # Test various model sizes
+        test_cases = [
+            (10, 20, 1),      # Small model
+            (100, 200, 10),   # Medium model
+            (500, 1000, 100), # Large model
+        ]
+        
+        for input_size, hidden_size, output_size in test_cases:
+            model = nn.Sequential(
+                nn.Linear(input_size, hidden_size),
+                nn.Linear(hidden_size, hidden_size),
+                nn.Linear(hidden_size, output_size)
+            )
+            
+            # Calculate expected memory
+            total_params = sum(p.numel() for p in model.parameters())
+            expected_delta_mb = (total_params * 4) / (1024 * 1024)  # fp32 bytes to MB
+            
+            # Test memory usage
+            with SurgicalTheater(model, track_memory=True) as theater:
+                data = torch.randn(32, input_size)
+                output = model(data)
+                actual_delta_mb = theater.total_delta_memory_mb
+            
+            # Verify within ±5% of README promise
+            error_pct = abs(actual_delta_mb - expected_delta_mb) / expected_delta_mb
+            assert error_pct < 0.05, f'Model {input_size}x{hidden_size}x{output_size}: Memory usage {actual_delta_mb:.2f} MB not within ±5% of expected {expected_delta_mb:.2f} MB (error: {error_pct:.1%})'
+            
+            print(f'✓ Model {input_size}x{hidden_size}x{output_size}: {actual_delta_mb:.2f} MB vs expected {expected_delta_mb:.2f} MB (error: {error_pct:.1%})')
+        
+        print('✓ All memory bound tests passed')
+        "

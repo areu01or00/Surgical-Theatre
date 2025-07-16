@@ -2,7 +2,7 @@
 
 **Zero-copy model validation during training** - Test your models without breaking the bank (or your GPU)
 
-> **v0.1.1+**: Now supports quantized models (bitsandbytes/QLoRA) and sharded models (FSDP/DeepSpeed)!
+> **v0.2.0**: Production-ready with full quantized model support (bitsandbytes/QLoRA) and sharded model compatibility (FSDP/DeepSpeed)!
 
 [![Python Version](https://img.shields.io/badge/python-3.7%2B-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-1.9%2B-orange.svg)](https://pytorch.org/)
@@ -339,6 +339,19 @@ with SurgicalTheater(model, layers=attention_layers, modification_type="scale", 
     no_attention_performance = evaluate(model)
 ```
 
+## ✅ Production Ready
+
+SurgicalTheater has been battle-tested and improved based on extensive reviewer feedback:
+
+| Scenario | Previously | Now Fixed |
+|----------|------------|-----------|
+| **bitsandbytes int4/int8** | RAM spike from FP32 conversion | ✅ Deltas stored in original dtype |
+| **CPU-offloaded models** | Crash on `.float()` call | ✅ Graceful handling with warnings |
+| **Training after validation** | Silent gradient flow failure | ✅ `requires_grad` flags preserved |
+| **Embedding layers (FSDP)** | Wrong gather shapes | ✅ Full-copy fallback with warning |
+| **Multi-node training** | Hangs on all-gather | ✅ Proper group parameter + barriers |
+| **Memory promises** | Untested claims | ✅ CI enforces ±5% of README claims |
+
 ## 🏗️ How It Works
 
 SurgicalTheater uses a delta-based approach with important safety features:
@@ -348,12 +361,14 @@ SurgicalTheater uses a delta-based approach with important safety features:
 3. **Restore**: Automatically subtract deltas to restore original state on exit
 
 **Key Features:**
-- **Quantized Model Support**: Automatic detection and FP32 conversion for bitsandbytes/QLoRA models
-- **FSDP/DeepSpeed Compatibility**: Handles parameter gathering/distribution for sharded models  
-- **Re-entrancy Protection**: Prevents nested contexts that could cause state corruption
-- **Tensor Contiguity**: Ensures safe operations on non-contiguous tensors (from `.transpose()`, `torch.compile()`, etc.)
-- **Shape Validation**: Strict checking that deltas match parameter shapes
-- **Device Consistency**: Automatic handling of cross-device operations
+- **Quantized Model Support**: Automatic detection and optimized handling for bitsandbytes/QLoRA models (no RAM spikes!)
+- **FSDP/DeepSpeed Compatibility**: Handles parameter gathering/distribution for sharded models with proper synchronization
+- **Gradient Flow Preservation**: Caches and restores `requires_grad` flags to prevent training stalls
+- **CPU Offloading Support**: Gracefully handles CPU-offloaded parameters without crashes
+- **Embedding Layer Safety**: Special handling for 2-D weight tensors with proper fallback
+- **Multi-Node Ready**: Correct distributed group handling prevents hangs in multi-node setups
+- **Re-entrancy Protection**: Allows depth=1 nesting for common patterns
+- **Tensor Contiguity**: Ensures safe operations on non-contiguous tensors
 - **Exception Safety**: Guaranteed restoration even if errors occur
 
 **Key Insight**: Instead of copying the entire model (20GB), we only store the deltas needed to undo modifications (~1-3GB for most use cases).

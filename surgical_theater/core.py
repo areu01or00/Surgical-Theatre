@@ -67,6 +67,7 @@ class SurgicalTheater:
         self._target_params = {}
         self._quantized_params = {}  # Track which params were quantized
         self._sharded_params = {}  # Track sharded parameter info
+        self._requires_grad_cache = {}  # Cache requires_grad flags
         
         # Memory tracking
         self._memory_before = 0
@@ -94,6 +95,9 @@ class SurgicalTheater:
             # Identify target parameters
             self._identify_target_parameters()
             
+            # Cache requires_grad flags before modification
+            self._cache_requires_grad()
+            
             # Ensure tensor contiguity for safe delta operations
             self._ensure_contiguity()
             
@@ -110,6 +114,9 @@ class SurgicalTheater:
         try:
             # Restore by subtracting deltas
             self._restore_from_deltas()
+            
+            # Restore requires_grad flags
+            self._restore_requires_grad()
         except Exception as e:
             raise RuntimeError(f"Failed to restore model weights: {e}") from e
         finally:
@@ -124,6 +131,7 @@ class SurgicalTheater:
                 self._target_params.clear()
                 self._quantized_params.clear()
                 self._sharded_params.clear()
+                self._requires_grad_cache.clear()
                 self._modifications_applied.clear()
     
     def _identify_target_parameters(self):
@@ -156,6 +164,17 @@ class SurgicalTheater:
                         else:
                             self._target_params[key] = param
     
+    def _cache_requires_grad(self):
+        """Cache requires_grad flags for all target parameters."""
+        for param_key, param in self._target_params.items():
+            self._requires_grad_cache[param_key] = param.requires_grad
+    
+    def _restore_requires_grad(self):
+        """Restore requires_grad flags for all target parameters."""
+        for param_key, param in self._target_params.items():
+            if param_key in self._requires_grad_cache:
+                param.requires_grad = self._requires_grad_cache[param_key]
+    
     def _ensure_contiguity(self):
         """Ensure all target parameters are contiguous to avoid storage aliasing issues."""
         for param_key, param in self._target_params.items():
@@ -180,15 +199,16 @@ class SurgicalTheater:
                 param_fp32 = param.data.float()
                 
                 # Compute delta on FP32 version
-                delta = self._compute_delta_for_param(param_fp32, param_key)
+                delta_fp32 = self._compute_delta_for_param(param_fp32, param_key)
                 
                 # Apply delta to FP32 version
-                modified_fp32 = param_fp32 + delta
+                modified_fp32 = param_fp32 + delta_fp32
                 
                 # Cast back to original quantized format and update parameter
                 param.data = modified_fp32.to(param.dtype)
                 
-                # Store the FP32 delta for restoration
+                # Store delta in original dtype to prevent RAM spike
+                delta = delta_fp32.to(param.dtype)
                 self._deltas[param_key] = delta.detach()
             else:
                 # Standard non-quantized parameter handling
@@ -262,6 +282,9 @@ class SurgicalTheater:
                 rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
                 
                 if world_size > 1:
+                    # Get the default process group for safety
+                    group = torch.distributed.group.WORLD
+                    
                     # Calculate shard boundaries
                     total_elements = delta.numel()
                     elements_per_shard = total_elements // world_size
@@ -272,6 +295,9 @@ class SurgicalTheater:
                     delta_flat = delta.flatten()
                     local_delta = delta_flat[start_idx:end_idx].reshape(original_param.shape)
                     original_param.data.sub_(local_delta)
+                    
+                    # Add barrier to ensure all ranks complete restoration
+                    torch.distributed.barrier(group=group)
                 else:
                     # Single device - apply full delta
                     original_param.data.sub_(delta)
@@ -282,6 +308,31 @@ class SurgicalTheater:
         except Exception as e:
             import warnings
             warnings.warn(f"Failed to restore sharded parameter {param_key}: {e}. Parameter may not be fully restored.")
+    
+    def _custom_add_int8_inplace(self, param: torch.Tensor, delta: torch.Tensor) -> None:
+        """Custom in-place addition for int8 parameters (bitsandbytes)."""
+        try:
+            # Check if this is a bitsandbytes parameter
+            if hasattr(param, '__class__') and 'Int8' in param.__class__.__name__:
+                # For bitsandbytes int8 parameters, we need special handling
+                # Convert to float, add delta, then quantize back
+                param_fp32 = param.data.float()
+                delta_fp32 = delta.float()
+                result_fp32 = param_fp32 + delta_fp32
+                
+                # Quantize back to int8 range
+                param.data = result_fp32.clamp(-127, 127).to(torch.int8)
+            else:
+                # Standard int8 addition with clamping
+                param_fp32 = param.data.float()
+                delta_fp32 = delta.float()
+                result_fp32 = param_fp32 + delta_fp32
+                param.data = result_fp32.clamp(-127, 127).to(param.dtype)
+        except Exception as e:
+            # Fallback to standard addition if custom logic fails
+            param.data = param.data.float()
+            param.data.add_(delta.float())
+            param.data = param.data.to(param.dtype)
     
     def _is_quantized_parameter(self, param: torch.Tensor) -> bool:
         """Check if a parameter is quantized (bitsandbytes, QLoRA, etc.)."""
@@ -334,6 +385,15 @@ class SurgicalTheater:
     def _gather_sharded_parameter(self, param: torch.Tensor, param_key: str) -> torch.Tensor:
         """Gather a sharded parameter across devices if needed."""
         try:
+            # Check for CPU-offloaded bitsandbytes parameters
+            if hasattr(param, '__class__') and 'Int8' in param.__class__.__name__:
+                if param.device.type == 'cpu':
+                    # Skip gather path for CPU-offloaded bnb parameters
+                    import warnings
+                    warnings.warn(f"Skipping gather for CPU-offloaded bitsandbytes parameter {param_key}. "
+                                "Using direct modification (may increase RAM usage).")
+                    return param.data
+            
             # Try FSDP gathering
             if hasattr(param, '_local_shard'):
                 # FSDP parameter - need to gather
@@ -352,11 +412,26 @@ class SurgicalTheater:
             
             # Try manual gathering for other distributed setups
             if torch.distributed.is_initialized() and param.dim() > 0:
+                # Check for 2-D weight tensors (embedding layers) - use full-copy fallback
+                if param.dim() == 2 and param.shape[0] > param.shape[1]:
+                    # Likely an embedding layer - shards are cut across rows
+                    import warnings
+                    warnings.warn(f"<WARN: full-copy used> for 2-D tensor {param_key} with shape {param.shape}. "
+                                "Embedding layer sharding not fully supported yet.")
+                    # Use full copy for now - TODO: implement proper embedding sharding
+                    return param.data.clone()
+                
                 # Simple all-gather for distributed parameters
                 world_size = torch.distributed.get_world_size()
                 if world_size > 1:
+                    # Get the default process group for safety
+                    group = torch.distributed.group.WORLD
                     gathered_tensors = [torch.zeros_like(param) for _ in range(world_size)]
-                    torch.distributed.all_gather(gathered_tensors, param)
+                    torch.distributed.all_gather(gathered_tensors, param, group=group)
+                    
+                    # Add barrier to ensure all ranks complete gathering
+                    torch.distributed.barrier(group=group)
+                    
                     # Concatenate or select based on sharding strategy
                     return torch.cat(gathered_tensors, dim=0)
             
