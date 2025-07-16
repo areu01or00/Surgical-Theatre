@@ -123,6 +123,17 @@ for epoch in range(num_epochs):
             # Model automatically restored to training state
 ```
 
+### 📓 Interactive Demo
+
+Check out our comprehensive [**demo notebook**](tests/demo.ipynb) which demonstrates:
+- Memory-efficient validation with ResNet-18
+- Perfect state restoration
+- Custom modification functions
+- Exception safety
+- Real training loop integration
+
+**[➡️ Open Demo Notebook](tests/demo.ipynb)**
+
 ### Memory Usage Visualization
 
 ```python
