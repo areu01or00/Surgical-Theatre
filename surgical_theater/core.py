@@ -282,33 +282,38 @@ class SurgicalTheater:
     
     def _restore_from_deltas(self):
         """Restore original parameters by subtracting deltas."""
-        # First restore quantized parameters from stored original data
-        for param_key in self._quantized_params:
-            if param_key in self._target_params:
-                param = self._target_params[param_key]
-                # Restore original quantized data directly
-                param.data = self._quantized_params[param_key]['original_data']
-        
-        # Then restore non-quantized parameters using deltas
-        for param_key, delta in self._deltas.items():
-            if param_key in self._target_params:
-                param = self._target_params[param_key]
-                
-                # Handle sharded parameter restoration
-                if param_key in self._sharded_params:
-                    self._restore_sharded_parameter(param_key, delta)
-                    continue
-                
-                # Handle quantized parameter restoration
-                if param_key in self._quantized_params:
-                    # For quantized params: restore the original quantized data directly
-                    # This avoids precision loss from delta arithmetic in quantized space
+        try:
+            # First restore quantized parameters from stored original data
+            for param_key in self._quantized_params:
+                if param_key in self._target_params:
+                    param = self._target_params[param_key]
+                    # Restore original quantized data directly
                     param.data = self._quantized_params[param_key]['original_data']
+            
+            # Then restore non-quantized parameters using deltas
+            for param_key, delta in self._deltas.items():
+                if param_key in self._target_params:
+                    param = self._target_params[param_key]
+                    
+                    # Handle sharded parameter restoration
+                    if param_key in self._sharded_params:
+                        self._restore_sharded_parameter(param_key, delta)
+                        continue
+                    
+                    # Handle quantized parameter restoration
+                    if param_key in self._quantized_params:
+                        # For quantized params: restore the original quantized data directly
+                        # This avoids precision loss from delta arithmetic in quantized space
+                        param.data = self._quantized_params[param_key]['original_data']
+                    else:
+                        # Standard restoration by subtracting the delta we applied
+                        param.data.sub_(delta)
                 else:
-                    # Standard restoration by subtracting the delta we applied
-                    param.data.sub_(delta)
-            else:
-                raise RuntimeError(f"Parameter {param_key} not found during restoration")
+                    raise RuntimeError(f"Parameter {param_key} not found during restoration")
+        finally:
+            # Always clear deltas and storage after restoration attempt
+            # This ensures we don't leak memory even if restoration fails partway through
+            pass  # Storage cleanup is handled in __exit__ finally block
     
     def _restore_sharded_parameter(self, param_key: str, delta: torch.Tensor):
         """Restore a sharded parameter by distributing the delta back."""
