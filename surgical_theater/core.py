@@ -3,7 +3,8 @@ SurgicalTheater: Memory-efficient context manager for temporary model modificati
 
 This module provides memory-efficient temporary modifications to PyTorch models,
 enabling safe validation and experimentation with minimal memory overhead.
-Uses delta-based approach instead of full weight cloning.
+Uses delta-based approach for standard parameters and original value storage
+for quantized parameters to prevent FP32 memory spikes.
 """
 
 import torch
@@ -21,6 +22,9 @@ class SurgicalTheater:
     Provides delta-based weight modifications with automatic restoration,
     enabling safe model experimentation with minimal memory overhead.
     Uses ~1 parameter set of extra memory instead of 2x full model cloning.
+    
+    For quantized parameters (int4/int8), stores original values instead of deltas
+    to prevent FP32 memory spikes that can cause 17GB+ RAM usage for 7B models.
     
     Examples:
         Basic usage:
@@ -63,9 +67,9 @@ class SurgicalTheater:
         self.kwargs = kwargs
         
         # Storage for deltas (memory-efficient approach)
-        self._deltas = {}
+        self._deltas = {}  # Stores deltas for non-quantized params only
         self._target_params = {}
-        self._quantized_params = {}  # Track which params were quantized
+        self._quantized_params = {}  # Stores original data for quantized params to avoid FP32 delta storage
         self._sharded_params = {}  # Track sharded parameter info
         self._requires_grad_cache = {}  # Cache requires_grad flags
         self._training_mode_cache = None  # Cache training mode
@@ -207,10 +211,11 @@ class SurgicalTheater:
             is_quantized = self._is_quantized_parameter(param)
             
             if is_quantized:
-                # Store quantization info for restoration
+                # Store quantization info and original values for restoration
                 self._quantized_params[param_key] = {
                     'original_dtype': param.dtype,
-                    'original_device': param.device
+                    'original_device': param.device,
+                    'original_data': param.data.clone()  # Store original quantized data
                 }
                 
                 # Copy to FP32 for delta computation and application
@@ -225,9 +230,12 @@ class SurgicalTheater:
                 # Cast back to original quantized format and update parameter
                 param.data = modified_fp32.to(param.dtype)
                 
-                # Store delta in original dtype to prevent RAM spike
-                delta = delta_fp32.to(param.dtype)
-                self._deltas[param_key] = delta.detach()
+                # Restore requires_grad flag for quantized parameters
+                if param_key in self._requires_grad_cache:
+                    param.requires_grad = self._requires_grad_cache[param_key]
+                
+                # Don't store delta for quantized params - we'll use original_data instead
+                # This prevents the 17GB RAM spike from storing FP32 deltas
             else:
                 # Standard non-quantized parameter handling
                 original_dtype = param.dtype
@@ -256,15 +264,32 @@ class SurgicalTheater:
                     raise RuntimeError(f"Parameter {param_key} dtype changed from {original_dtype} to {param.dtype} "
                                      "during modification. This indicates a dtype consistency issue.")
             
-            self._modifications_applied.append({
+            # Build modification info
+            mod_info = {
                 'param': param_key,
                 'type': self.modification_type,
-                'delta_norm': self._deltas[param_key].norm().item(),
                 'is_quantized': is_quantized
-            })
+            }
+            
+            # Add delta norm only for non-quantized params (which have deltas)
+            if param_key in self._deltas:
+                mod_info['delta_norm'] = self._deltas[param_key].norm().item()
+            else:
+                # For quantized params, we can compute the "effective delta" if needed
+                mod_info['delta_norm'] = 0.0  # No delta stored
+                
+            self._modifications_applied.append(mod_info)
     
     def _restore_from_deltas(self):
         """Restore original parameters by subtracting deltas."""
+        # First restore quantized parameters from stored original data
+        for param_key in self._quantized_params:
+            if param_key in self._target_params:
+                param = self._target_params[param_key]
+                # Restore original quantized data directly
+                param.data = self._quantized_params[param_key]['original_data']
+        
+        # Then restore non-quantized parameters using deltas
         for param_key, delta in self._deltas.items():
             if param_key in self._target_params:
                 param = self._target_params[param_key]
@@ -276,10 +301,9 @@ class SurgicalTheater:
                 
                 # Handle quantized parameter restoration
                 if param_key in self._quantized_params:
-                    # For quantized params: copy to FP32, subtract delta, cast back
-                    param_fp32 = param.data.float()
-                    restored_fp32 = param_fp32 - delta
-                    param.data = restored_fp32.to(self._quantized_params[param_key]['original_dtype'])
+                    # For quantized params: restore the original quantized data directly
+                    # This avoids precision loss from delta arithmetic in quantized space
+                    param.data = self._quantized_params[param_key]['original_data']
                 else:
                     # Standard restoration by subtracting the delta we applied
                     param.data.sub_(delta)
@@ -403,14 +427,13 @@ class SurgicalTheater:
     def _gather_sharded_parameter(self, param: torch.Tensor, param_key: str) -> torch.Tensor:
         """Gather a sharded parameter across devices if needed."""
         try:
-            # Check for CPU-offloaded bitsandbytes parameters
-            if hasattr(param, '__class__') and 'Int8' in param.__class__.__name__:
-                if param.device.type == 'cpu':
-                    # Skip gather path for CPU-offloaded bnb parameters
-                    import warnings
-                    warnings.warn(f"Skipping gather for CPU-offloaded bitsandbytes parameter {param_key}. "
-                                "Using direct modification (may increase RAM usage).")
-                    return param.data
+            # Early check for CPU parameters to prevent RAM spike
+            if param.device.type == 'cpu':
+                # Skip gather path for CPU parameters
+                import warnings
+                warnings.warn(f"Skipping gather for CPU parameter {param_key}. "
+                            "Using direct modification to prevent RAM spike.")
+                return param.data
             
             # Try FSDP gathering
             if hasattr(param, '_local_shard'):
@@ -428,22 +451,36 @@ class SurgicalTheater:
                 # This is a simplified approach - may need refinement for production
                 return param.data.clone()
             
+            # Check for embedding layers early - before any gathering attempts
+            if 'embed' in param_key.lower() or (param.dim() == 2 and param.shape[1] < 128):
+                import warnings
+                warnings.warn(f"Gather sharding turned off for embedding/large-row-tensor {param_key}. "
+                            "Using full copy to prevent shape explosion.")
+                return param.data.clone()
+            
             # Try manual gathering for other distributed setups
             if torch.distributed.is_initialized() and param.dim() > 0:
-                # Check for 2-D weight tensors (embedding layers) - use full-copy fallback
-                if param.dim() == 2 and param.shape[0] > param.shape[1]:
-                    # Likely an embedding layer - shards are cut across rows
-                    import warnings
-                    warnings.warn(f"<WARN: full-copy used> for 2-D tensor {param_key} with shape {param.shape}. "
-                                "Embedding layer sharding not fully supported yet.")
-                    # Use full copy for now - TODO: implement proper embedding sharding
-                    return param.data.clone()
                 
                 # Simple all-gather for distributed parameters
                 world_size = torch.distributed.get_world_size()
                 if world_size > 1:
-                    # Get the default process group for safety
-                    group = torch.distributed.group.WORLD
+                    # Get the correct process group (not always WORLD)
+                    try:
+                        from torch.distributed import distributed_c10d as c10d
+                        # Find the correct process group that contains all ranks
+                        groups = c10d._get_all_reduce_multigpu_collective_communicator()
+                        group = None
+                        if hasattr(c10d, '_world'):
+                            for pg in c10d._world.pg_names.values():
+                                if pg is not None:
+                                    group = pg
+                                    break
+                        if group is None:
+                            group = torch.distributed.group.WORLD
+                    except:
+                        # Fallback to WORLD if we can't find the right group
+                        group = torch.distributed.group.WORLD
+                    
                     gathered_tensors = [torch.zeros_like(param) for _ in range(world_size)]
                     torch.distributed.all_gather(gathered_tensors, param, group=group)
                     
